@@ -90,12 +90,30 @@ jobs:
           # Build Hybrid Exit
           CGO_ENABLED=0 GOOS=${{ matrix.goos }} GOARCH=${{ matrix.goarch }} GOARM=${{ matrix.goarm }} go build -o $HYBRID_FOLDER/hybrid-exit$SUFFIX ./cmd/hybrid-exit
           
-          # Copy and rename config files
-          cp client_config.json.example $CLIENT_FOLDER/client_config.json
-          cp server_config.json.example $SERVER_FOLDER/server_config.json
-          cp hybrid/SaffronBridge/starter/client_config.example.jsonc $HYBRID_FOLDER/client_config.example.jsonc
-          cp hybrid/SaffronBridge/starter/exit_config.example.jsonc $HYBRID_FOLDER/exit_config.example.jsonc
-          cp hybrid/SaffronBridge/starter/appscript_relay.gs $HYBRID_FOLDER/appscript_relay.gs
+          # Copy config examples when present (clean repos may omit some files)
+          if [ -f client_config.json.example ]; then
+            cp client_config.json.example $CLIENT_FOLDER/client_config.json
+          elif [ -f client_config.example.json ]; then
+            cp client_config.example.json $CLIENT_FOLDER/client_config.json
+          elif [ -f hybrid/SaffronBridge/starter/client_config.example.jsonc ]; then
+            cp hybrid/SaffronBridge/starter/client_config.example.jsonc $CLIENT_FOLDER/client_config.example.jsonc
+          fi
+
+          if [ -f server_config.json.example ]; then
+            cp server_config.json.example $SERVER_FOLDER/server_config.json
+          elif [ -f exit_config.example.json ]; then
+            cp exit_config.example.json $SERVER_FOLDER/server_config.json
+          fi
+
+          if [ -f hybrid/SaffronBridge/starter/client_config.example.jsonc ]; then
+            cp hybrid/SaffronBridge/starter/client_config.example.jsonc $HYBRID_FOLDER/client_config.example.jsonc
+          fi
+          if [ -f hybrid/SaffronBridge/starter/exit_config.example.jsonc ]; then
+            cp hybrid/SaffronBridge/starter/exit_config.example.jsonc $HYBRID_FOLDER/exit_config.example.jsonc
+          fi
+          if [ -f hybrid/SaffronBridge/starter/appscript_relay.gs ]; then
+            cp hybrid/SaffronBridge/starter/appscript_relay.gs $HYBRID_FOLDER/appscript_relay.gs
+          fi
           
           # Copy README
           cp README.md $CLIENT_FOLDER/
@@ -111,6 +129,6 @@ jobs:
       - name: Release
         uses: softprops/action-gh-release@v1
         with:
-          files: hybrid-relay-google-*.zip
+          files: '*.zip'
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

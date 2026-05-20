@@ -70,9 +70,11 @@ jobs:
           
           CLIENT_FOLDER="flowdriver-client-${VERSION}-${{ matrix.os }}"
           SERVER_FOLDER="flowdriver-server-${VERSION}-${{ matrix.os }}"
+          HYBRID_FOLDER="flowdriver-hybrid-${VERSION}-${{ matrix.os }}"
           
           mkdir -p $CLIENT_FOLDER
           mkdir -p $SERVER_FOLDER
+          mkdir -p $HYBRID_FOLDER
           
           SUFFIX=""
           if [ "${{ matrix.goos }}" == "windows" ]; then
@@ -84,22 +86,31 @@ jobs:
           
           # Build Server
           CGO_ENABLED=0 GOOS=${{ matrix.goos }} GOARCH=${{ matrix.goarch }} GOARM=${{ matrix.goarm }} go build -o $SERVER_FOLDER/server$SUFFIX ./cmd/server
+
+          # Build Hybrid Exit
+          CGO_ENABLED=0 GOOS=${{ matrix.goos }} GOARCH=${{ matrix.goarch }} GOARM=${{ matrix.goarm }} go build -o $HYBRID_FOLDER/hybrid-exit$SUFFIX ./cmd/hybrid-exit
           
           # Copy and rename config files
           cp client_config.json.example $CLIENT_FOLDER/client_config.json
           cp server_config.json.example $SERVER_FOLDER/server_config.json
+          cp hybrid/SaffronBridge/starter/client_config.example.jsonc $HYBRID_FOLDER/client_config.example.jsonc
+          cp hybrid/SaffronBridge/starter/exit_config.example.jsonc $HYBRID_FOLDER/exit_config.example.jsonc
+          cp hybrid/SaffronBridge/starter/appscript_relay.gs $HYBRID_FOLDER/appscript_relay.gs
           
           # Copy README
           cp README.md $CLIENT_FOLDER/
           cp README.md $SERVER_FOLDER/
+          cp README.md $HYBRID_FOLDER/
+          cp HYBRID.MD $HYBRID_FOLDER/
           
           # Zip the folders
           zip -r "${CLIENT_FOLDER}.zip" $CLIENT_FOLDER
           zip -r "${SERVER_FOLDER}.zip" $SERVER_FOLDER
+          zip -r "${HYBRID_FOLDER}.zip" $HYBRID_FOLDER
 
       - name: Release
         uses: softprops/action-gh-release@v1
         with:
-          files: flowdriver-*.zip
+          files: hybrid-relay-google-*.zip
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

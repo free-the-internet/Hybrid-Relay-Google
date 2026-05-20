@@ -36,7 +36,12 @@ This repository now includes a hybrid path named **SaffronBridge**:
 
 ## Setup
 
-- Hybrid mode guide: [HYBRID.MD](HYBRID.MD)
+- What you need is:
+1. A VPS outside the restricted country, acting as the exit node.
+2. An Apps Script deployment ID.
+3. Google Drive API enabled and an OAuth token.
+
+- Hybrid mode configuration guide: [HYBRID.MD](HYBRID.MD)
 
 
 <div style="border: 2px solid #ff4d4f; padding: 10px 12px; border-radius: 8px; background: #fff1f0; color: #a8071a; font-weight: 600;">

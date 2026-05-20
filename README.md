@@ -44,9 +44,8 @@ This repository now includes a hybrid path named **SaffronBridge**:
 - Hybrid mode configuration guide: [HYBRID.MD](HYBRID.MD)
 
 
-<div style="border: 2px solid #ff4d4f; padding: 10px 12px; border-radius: 8px; background: #fff1f0; color: #a8071a; font-weight: 600;">
-You can omit the rest of this README.
-</div>
+> [!TIP]
+> You can omit the rest of this README.
 
 ## How it Works / نحوه عملکرد
 

@@ -32,10 +32,13 @@ func main() {
 	}
 
 	var backend storage.Backend
-	if appCfg.StorageType == "google" {
-		customHttpClient := httpclient.NewCustomClient(appCfg.Transport)
+	switch appCfg.StorageType {
+	case "google", "saffronbridge":
+		driveTransport := appCfg.Transport
+		driveTransport.HostHeader = "www.googleapis.com"
+		customHttpClient := httpclient.NewCustomClient(driveTransport)
 		backend = storage.NewGoogleBackend(customHttpClient, gcPath, appCfg.GoogleFolderID)
-	} else {
+	default:
 		backend, err = storage.NewLocalBackend(appCfg.LocalDir)
 		if err != nil {
 			log.Fatalf("Failed to init local storage: %v", err)
@@ -46,7 +49,7 @@ func main() {
 	}
 
 	// AUTOMATION: If folder ID is missing, find or create it
-	if appCfg.StorageType == "google" && appCfg.GoogleFolderID == "" {
+	if (appCfg.StorageType == "google" || appCfg.StorageType == "saffronbridge") && appCfg.GoogleFolderID == "" {
 		log.Println("Zero-Config: Searching for existing Google Drive folder 'Flow-Data'...")
 		folderID, err := backend.FindFolder(ctx, "Flow-Data")
 		if err != nil {

@@ -14,6 +14,39 @@
 
 ---
 
+
+## SaffronBridge Hybrid Mode (Apps Script + Drive)
+
+This repository now includes a hybrid path named **SaffronBridge**:
+
+**SaffronBridge** features:
+
+1. Reduces Apps Script request quota usage, since quotas are consumed only for upstream traffic.
+2. Lower latency compared to the original Google Drive–based solution.
+3. Suitable for remaining online and streaming YouTube all day without exhausting quotas.
+
+### How it works?
+
+1. **Request uplink**: Client request mux files are sent to Apps Script (`script.google.com`) instead of direct Drive upload.
+2. **Exit processing**: Apps Script forwards JSON payload to a VPS HTTP relay (`cmd/hybrid-exit`).
+3. **Response downlink**: Exit node writes response mux files to Google Drive, and client receives them with the existing Flow Driver polling path.
+
+### Why this design:
+- Keeps response path stable and battle-tested (Drive backend in this repo).
+- Makes it easy to switch request path between relay and Drive fallback.
+- Avoids protocol mismatch between this Flow Driver engine and external tools.
+
+
+
+## Setup
+
+- Hybrid mode guide: [HYBRID.MD](HYBRID.MD)
+
+
+<div style="border: 2px solid #ff4d4f; padding: 10px 12px; border-radius: 8px; background: #fff1f0; color: #a8071a; font-weight: 600;">
+You can omit the rest of this README.
+</div>
+
 ## How it Works / نحوه عملکرد
 
 ### English
@@ -58,6 +91,7 @@ To get your `credentials.json`, follow the instructions on the [Google Drive API
 ```bash
 go build -o bin/client ./cmd/client
 go build -o bin/server ./cmd/server
+go build -o bin/hybrid-exit ./cmd/hybrid-exit
 ```
 
 ### 2. Configuration / پیکربندی
@@ -68,17 +102,28 @@ Create your `config.json` based on the provided examples:
 ```json
 {
   "listen_addr": "127.0.0.1:1080",
-  "storage_type": "google",
+  "storage_type": "saffronbridge",
   "google_folder_id": "YOUR_FOLDER_ID",
   "refresh_rate_ms": 100,
   "flush_rate_ms": 300,
   "transport": {
     "TargetIP": "216.239.38.120:443",
     "SNI": "google.com",
-    "HostHeader": "www.googleapis.com"
+    "HostHeader": "script.google.com"
+  },
+  "hybrid_relay": {
+    "appscript_url": "YOUR_DEPLOYMENT_ID_OR_FULL_EXEC_URL",
+    "shared_token": "CHANGE_ME",
+    "fallback_to_drive": true
   }
 }
 ```
+
+`hybrid_relay.appscript_url` accepts either:
+- Deployment ID only (the part between `/s/` and `/exec`), or
+- Full Apps Script `/exec` URL.
+
+The client normalizes both forms to the same canonical `/exec` URL.
 ---
 
 ## Performance & Quotas / عملکرد و سهمیه‌ها
@@ -101,7 +146,11 @@ Create your `config.json` based on the provided examples:
   "storage_type": "google",
   "google_folder_id": "YOUR_FOLDER_ID",
   "refresh_rate_ms": 100,
-  "flush_rate_ms": 300
+  "flush_rate_ms": 300,
+  "hybrid_relay": {
+    "shared_token": "CHANGE_ME",
+    "exit_listen_addr": "0.0.0.0:8099"
+  }
 }
 ```
 
@@ -112,10 +161,23 @@ Create your `config.json` based on the provided examples:
 ./bin/server -c server_config.json -gc credentials.json
 ```
 
+**Hybrid Exit (for SaffronBridge):**
+```bash
+./bin/hybrid-exit -c server_config.json -gc credentials.json
+```
+
 **Client:**
 ```bash
 ./bin/client -c client_config.json -gc credentials.json
 ```
+
+### Apps Script Relay File
+
+Use the ready-to-deploy Apps Script file in:
+
+`hybrid/SaffronBridge/appscript_relay.gs`
+
+Set `RELAY_URL` to your VPS hybrid-exit endpoint and `SHARED_TOKEN` to match `hybrid_relay.shared_token` in server config.
 
 ---
 

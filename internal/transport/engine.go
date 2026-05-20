@@ -93,6 +93,49 @@ func (e *Engine) Start(ctx context.Context) {
 	go e.cleanupLoop(ctx) // Delete files older than 10s
 }
 
+// IngestMuxReader decodes a mux stream and processes all envelopes.
+// fileClientID should be the client ID parsed from req-<client>-mux-*.bin naming.
+func (e *Engine) IngestMuxReader(r io.Reader, fileClientID string) (int, error) {
+	count := 0
+	for {
+		var env Envelope
+		if err := env.Decode(r); err != nil {
+			if err == io.EOF || err == io.ErrUnexpectedEOF {
+				return count, nil
+			}
+			return count, err
+		}
+		count++
+		e.processEnvelope(&env, fileClientID)
+	}
+}
+
+func (e *Engine) processEnvelope(env *Envelope, fileClientID string) {
+	e.closedSessionsMu.Lock()
+	if _, exists := e.closedSessions[env.SessionID]; exists {
+		e.closedSessionsMu.Unlock()
+		return
+	}
+	e.closedSessionsMu.Unlock()
+
+	e.sessionMu.Lock()
+	s, exists := e.sessions[env.SessionID]
+	if !exists && e.myDir == DirRes && e.OnNewSession != nil {
+		s = NewSession(env.SessionID)
+		s.ClientID = fileClientID
+		e.sessions[env.SessionID] = s
+		e.sessionMu.Unlock()
+		log.Printf("Engine: Triggering new session %s for Client %s", env.SessionID, fileClientID)
+		e.OnNewSession(env.SessionID, env.TargetAddr, s)
+	} else {
+		e.sessionMu.Unlock()
+	}
+
+	if s != nil {
+		s.ProcessRx(env)
+	}
+}
+
 func (e *Engine) GetSession(id string) *Session {
 	e.sessionMu.RLock()
 	defer e.sessionMu.RUnlock()
@@ -320,6 +363,15 @@ func (e *Engine) pollLoop(ctx context.Context) {
 						return
 					}
 					defer rc.Close()
+					if e.myDir == DirRes {
+						parts := strings.Split(fname, "-")
+						if len(parts) >= 4 && parts[2] == "mux" {
+							tsStr := strings.TrimSuffix(parts[3], ".bin")
+							if ts, err := strconv.ParseInt(tsStr, 10, 64); err == nil && ts > 0 {
+								log.Printf("[engine] drive ingress file=%s queue_ms=%d", fname, time.Since(time.Unix(0, ts)).Milliseconds())
+							}
+						}
+					}
 
 					// Extract ClientID from filename for server-side session initialization
 					var fileClientID string
@@ -328,42 +380,8 @@ func (e *Engine) pollLoop(ctx context.Context) {
 						fileClientID = parts[1]
 					}
 
-					// STREAMING DECODE
-					count := 0
-					for {
-						var env Envelope
-						if err := env.Decode(rc); err != nil {
-							if err != io.EOF && err != io.ErrUnexpectedEOF {
-								log.Printf("mux decode error %s: %v", fname, err)
-							}
-							break
-						}
-						count++
-
-						// Process envelope immediately
-						e.closedSessionsMu.Lock()
-						if _, exists := e.closedSessions[env.SessionID]; exists {
-							e.closedSessionsMu.Unlock()
-							continue
-						}
-						e.closedSessionsMu.Unlock()
-
-						e.sessionMu.Lock()
-						s, exists := e.sessions[env.SessionID]
-						if !exists && e.myDir == DirRes && e.OnNewSession != nil {
-							s = NewSession(env.SessionID)
-							s.ClientID = fileClientID
-							e.sessions[env.SessionID] = s
-							e.sessionMu.Unlock()
-							log.Printf("Engine: Triggering new session %s for Client %s", env.SessionID, fileClientID)
-							e.OnNewSession(env.SessionID, env.TargetAddr, s)
-						} else {
-							e.sessionMu.Unlock()
-						}
-
-						if s != nil {
-							s.ProcessRx(&env)
-						}
+					if _, err := e.IngestMuxReader(rc, fileClientID); err != nil {
+						log.Printf("mux decode error %s: %v", fname, err)
 					}
 
 					e.backend.Delete(ctx, fname)

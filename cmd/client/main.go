@@ -50,10 +50,35 @@ func main() {
 	}
 
 	var backend storage.Backend
-	if appCfg.StorageType == "google" {
+	switch appCfg.StorageType {
+	case "google":
 		customHttpClient := httpclient.NewCustomClient(appCfg.Transport)
 		backend = storage.NewGoogleBackend(customHttpClient, gcPath, appCfg.GoogleFolderID)
-	} else {
+	case "saffronbridge":
+		driveTransport := appCfg.Transport
+		driveTransport.HostHeader = "www.googleapis.com"
+		driveHTTPClient := httpclient.NewCustomClient(driveTransport)
+
+		relayTransport := appCfg.Transport
+		// Keep Host header untouched in relay mode so Apps Script redirects
+		// to script.googleusercontent.com continue to work end-to-end.
+		relayTransport.HostHeader = ""
+		if relayTransport.SNI == "" || relayTransport.SNI == "google.com" {
+			relayTransport.SNI = "www.google.com"
+		}
+		relayHTTPClient := httpclient.NewCustomClient(relayTransport)
+
+		driveBackend := storage.NewGoogleBackend(driveHTTPClient, gcPath, appCfg.GoogleFolderID)
+		backend = storage.NewHybridRelayBackend(
+			driveBackend,
+			relayHTTPClient,
+			appCfg.HybridRelay.AppScriptURL,
+			appCfg.HybridRelay.SharedToken,
+			appCfg.HybridRelay.FallbackToDrive,
+		)
+		log.Printf("Hybrid mode enabled: request uplink via Apps Script relay, response downlink via Drive. fallback_to_drive=%t", appCfg.HybridRelay.FallbackToDrive)
+		log.Printf("Hybrid relay fronting: target_ip=%s sni=%s", relayTransport.TargetIP, relayTransport.SNI)
+	default:
 		backend, err = storage.NewLocalBackend(appCfg.LocalDir)
 		if err != nil {
 			log.Fatalf("Failed to init local storage: %v", err)
@@ -64,7 +89,7 @@ func main() {
 	}
 
 	// AUTOMATION: If folder ID is missing, find or create it
-	if appCfg.StorageType == "google" && appCfg.GoogleFolderID == "" {
+	if (appCfg.StorageType == "google" || appCfg.StorageType == "saffronbridge") && appCfg.GoogleFolderID == "" {
 		log.Println("Zero-Config: Searching for existing Google Drive folder 'Flow-Data'...")
 		folderID, err := backend.FindFolder(ctx, "Flow-Data")
 		if err != nil {

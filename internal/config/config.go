@@ -16,7 +16,7 @@ type AppConfig struct {
 	// ClientID identifies this client node to allow multi-tenant folder sharing.
 	ClientID string `json:"client_id,omitempty"`
 
-	// StorageType defines the backend ("local" or "google").
+	// StorageType defines the backend ("local", "google", or "saffronbridge").
 	StorageType string `json:"storage_type"`
 
 	// LocalDir is the path used when StorageType is "local".
@@ -33,6 +33,25 @@ type AppConfig struct {
 
 	// Transport configures the dpi-evasion layer.
 	Transport httpclient.TransportConfig `json:"transport,omitempty"`
+
+	// HybridRelay enables the SaffronBridge mode where client uploads requests
+	// through Apps Script relay while responses continue via Drive polling.
+	HybridRelay HybridRelayConfig `json:"hybrid_relay,omitempty"`
+}
+
+// HybridRelayConfig defines options for the Apps Script request relay path.
+type HybridRelayConfig struct {
+	// AppScriptURL accepts either deployment ID (AKfycb...) or full /exec URL.
+	AppScriptURL string `json:"appscript_url,omitempty"`
+
+	// SharedToken is optional bearer token attached to relay HTTP requests.
+	SharedToken string `json:"shared_token,omitempty"`
+
+	// FallbackToDrive makes client upload to Drive directly if relay fails.
+	FallbackToDrive bool `json:"fallback_to_drive,omitempty"`
+
+	// ExitListenAddr is used by cmd/hybrid-exit as the local HTTP listen address.
+	ExitListenAddr string `json:"exit_listen_addr,omitempty"`
 }
 
 // Save writes the config back to a JSON file.

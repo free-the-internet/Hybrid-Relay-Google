@@ -5,9 +5,11 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/NullLatency/flow-driver/internal/storage"
@@ -40,7 +42,65 @@ type Engine struct {
 	// Track processed files to avoid duplicates
 	processed   map[string]bool
 	processedMu sync.Mutex
+
+	metrics engineMetrics
 }
+
+type engineMetrics struct {
+	envelopesRX      uint64
+	envelopesTX      uint64
+	ackMarkersRX     uint64
+	ackOnlyRX        uint64
+	ackReleased      uint64
+	ackControlTX     uint64
+	ackPiggybackTX   uint64
+	retransmitTX     uint64
+	retransmitRounds uint64
+	uploadFiles      uint64
+	uploadErrors     uint64
+	pollListErrors   uint64
+	downloadErrors   uint64
+	decodeErrors     uint64
+	cleanupDeletes   uint64
+	staleDrops       uint64
+	closeAcked       uint64
+	closeTimedOut    uint64
+}
+
+type engineMetricsSnapshot struct {
+	envelopesRX      uint64
+	envelopesTX      uint64
+	ackMarkersRX     uint64
+	ackOnlyRX        uint64
+	ackReleased      uint64
+	ackControlTX     uint64
+	ackPiggybackTX   uint64
+	retransmitTX     uint64
+	retransmitRounds uint64
+	uploadFiles      uint64
+	uploadErrors     uint64
+	pollListErrors   uint64
+	downloadErrors   uint64
+	decodeErrors     uint64
+	cleanupDeletes   uint64
+	staleDrops       uint64
+	closeAcked       uint64
+	closeTimedOut    uint64
+}
+
+const (
+	// Retransmit unacked tunnel envelopes conservatively to avoid quota spikes.
+	txRetransmitAfter = 5 * time.Second
+	txRetransmitBurst = 4
+
+	// If no data is going out, send occasional lightweight ACK control frames.
+	ackControlInterval = 2 * time.Second
+
+	metricsLogInterval = 10 * time.Second
+
+	// Keep closed sessions around long enough to flush/retransmit tail packets.
+	closeDrainTimeout = 25 * time.Second
+)
 
 func NewEngine(backend storage.Backend, isClient bool, clientID string) *Engine {
 	e := &Engine{
@@ -90,6 +150,7 @@ func (e *Engine) SetFlushRate(ms int) {
 func (e *Engine) Start(ctx context.Context) {
 	go e.flushLoop(ctx)
 	go e.pollLoop(ctx)
+	go e.metricsLoop(ctx)
 	go e.cleanupLoop(ctx) // Delete files older than 10s
 }
 
@@ -103,14 +164,28 @@ func (e *Engine) IngestMuxReader(r io.Reader, fileClientID string) (int, error) 
 			if err == io.EOF || err == io.ErrUnexpectedEOF {
 				return count, nil
 			}
+			atomic.AddUint64(&e.metrics.decodeErrors, 1)
 			return count, err
 		}
 		count++
+		atomic.AddUint64(&e.metrics.envelopesRX, 1)
 		e.processEnvelope(&env, fileClientID)
 	}
 }
 
 func (e *Engine) processEnvelope(env *Envelope, fileClientID string) {
+	ackSeq, hasAck := parseAckMarker(env.TargetAddr)
+	ackOnly := hasAck && env.Seq == 0 && !env.Close && len(env.Payload) == 0
+	if hasAck {
+		atomic.AddUint64(&e.metrics.ackMarkersRX, 1)
+	}
+	if ackOnly {
+		atomic.AddUint64(&e.metrics.ackOnlyRX, 1)
+	}
+	if hasAck {
+		env.TargetAddr = ""
+	}
+
 	e.closedSessionsMu.Lock()
 	if _, exists := e.closedSessions[env.SessionID]; exists {
 		e.closedSessionsMu.Unlock()
@@ -120,7 +195,7 @@ func (e *Engine) processEnvelope(env *Envelope, fileClientID string) {
 
 	e.sessionMu.Lock()
 	s, exists := e.sessions[env.SessionID]
-	if !exists && e.myDir == DirRes && e.OnNewSession != nil {
+	if !exists && e.myDir == DirRes && e.OnNewSession != nil && !ackOnly {
 		s = NewSession(env.SessionID)
 		s.ClientID = fileClientID
 		e.sessions[env.SessionID] = s
@@ -132,6 +207,15 @@ func (e *Engine) processEnvelope(env *Envelope, fileClientID string) {
 	}
 
 	if s != nil {
+		if hasAck {
+			released := s.ApplyRemoteAck(ackSeq)
+			if released > 0 {
+				atomic.AddUint64(&e.metrics.ackReleased, released)
+			}
+		}
+		if ackOnly {
+			return
+		}
 		s.ProcessRx(env)
 	}
 }
@@ -171,6 +255,7 @@ func (e *Engine) flushAll(ctx context.Context) {
 	}
 	e.sessionMu.Unlock()
 
+	now := time.Now()
 	muxes := make(map[string][]Envelope)
 	var closedSessionIDs []string
 
@@ -180,38 +265,128 @@ func (e *Engine) flushAll(ctx context.Context) {
 		// Idle Timeout check
 		if time.Since(s.lastActivity) > 10*time.Second {
 			s.closed = true
+			if s.closeStart.IsZero() {
+				s.closeStart = now
+			}
 		}
 
-		shouldSend := len(s.txBuf) > 0 || (s.txSeq == 0 && e.myDir == DirReq) || s.closed
-
-		if !shouldSend {
-			s.mu.Unlock()
-			continue
-		}
-
-		payload := s.txBuf
-		s.txBuf = nil
-		s.txCond.Broadcast() // Release any blocked writers
-
-		env := Envelope{
-			SessionID:  s.ID,
-			Seq:        s.txSeq,
-			Payload:    payload,
-			Close:      s.closed,
-			TargetAddr: s.TargetAddr,
-		}
-
-		s.txSeq++
-		if s.closed {
-			closedSessionIDs = append(closedSessionIDs, s.ID)
+		if s.closed && s.closeStart.IsZero() {
+			s.closeStart = now
 		}
 
 		cid := s.ClientID
 		if cid == "" && e.myDir == DirReq {
 			cid = e.id // For client requests, use our own ID
 		}
+		if cid == "" {
+			cid = "unknown"
+		}
 
-		muxes[cid] = append(muxes[cid], env)
+		// Retransmit oldest unacked envelopes first.
+		if len(s.txPending) > 0 {
+			pendingSeqs := make([]uint64, 0, len(s.txPending))
+			for seq, p := range s.txPending {
+				if now.Sub(p.sentAt) >= txRetransmitAfter {
+					pendingSeqs = append(pendingSeqs, seq)
+				}
+			}
+			sort.Slice(pendingSeqs, func(i, j int) bool { return pendingSeqs[i] < pendingSeqs[j] })
+			if len(pendingSeqs) > txRetransmitBurst {
+				pendingSeqs = pendingSeqs[:txRetransmitBurst]
+			}
+			if len(pendingSeqs) > 0 {
+				atomic.AddUint64(&e.metrics.retransmitRounds, 1)
+				log.Printf("[engine-ack] retransmit sid=%s count=%d pending=%d rx_next=%d", s.ID, len(pendingSeqs), len(s.txPending), s.rxSeq)
+			}
+
+			for _, seq := range pendingSeqs {
+				p := s.txPending[seq]
+				env := p.env
+				if env.TargetAddr == "" || isAckMarker(env.TargetAddr) {
+					env.TargetAddr = makeAckMarker(s.rxSeq)
+					p.env.TargetAddr = env.TargetAddr
+					s.ackDirty = false
+					atomic.AddUint64(&e.metrics.ackPiggybackTX, 1)
+				}
+				muxes[cid] = append(muxes[cid], env)
+				atomic.AddUint64(&e.metrics.retransmitTX, 1)
+				atomic.AddUint64(&e.metrics.envelopesTX, 1)
+				p.sentAt = now
+			}
+		}
+
+		sendClose := s.closed && !s.closeSent
+		shouldSend := len(s.txBuf) > 0 || (s.txSeq == 0 && e.myDir == DirReq) || sendClose
+
+		if shouldSend {
+			payload := s.txBuf
+			s.txBuf = nil
+			s.txCond.Broadcast() // Release any blocked writers
+
+			targetAddr := ""
+			if s.txSeq == 0 {
+				targetAddr = s.TargetAddr
+			}
+			if targetAddr == "" {
+				targetAddr = makeAckMarker(s.rxSeq)
+				s.ackDirty = false
+				atomic.AddUint64(&e.metrics.ackPiggybackTX, 1)
+			}
+
+			envClose := sendClose
+
+			env := Envelope{
+				SessionID:  s.ID,
+				Seq:        s.txSeq,
+				Payload:    payload,
+				Close:      envClose,
+				TargetAddr: targetAddr,
+			}
+
+			s.txPending[s.txSeq] = &pendingEnvelope{env: env, sentAt: now}
+			if envClose {
+				s.closeSent = true
+			}
+
+			s.txSeq++
+			if s.closed {
+				closedSessionIDs = append(closedSessionIDs, s.ID)
+			}
+
+			muxes[cid] = append(muxes[cid], env)
+			atomic.AddUint64(&e.metrics.envelopesTX, 1)
+			s.mu.Unlock()
+			continue
+		}
+
+		if s.txSeq > 0 && s.ackDirty && now.Sub(s.lastAckCtrl) >= ackControlInterval {
+			ackEnv := Envelope{
+				SessionID:  s.ID,
+				Seq:        0,
+				TargetAddr: makeAckMarker(s.rxSeq),
+			}
+			muxes[cid] = append(muxes[cid], ackEnv)
+			atomic.AddUint64(&e.metrics.ackControlTX, 1)
+			atomic.AddUint64(&e.metrics.envelopesTX, 1)
+			s.lastAckCtrl = now
+			s.ackDirty = false
+		}
+
+		if s.closed && s.closeSent {
+			if len(s.txPending) == 0 {
+				atomic.AddUint64(&e.metrics.closeAcked, 1)
+				closedSessionIDs = append(closedSessionIDs, s.ID)
+				s.mu.Unlock()
+				continue
+			}
+			if !s.closeStart.IsZero() && now.Sub(s.closeStart) >= closeDrainTimeout {
+				atomic.AddUint64(&e.metrics.closeTimedOut, 1)
+				log.Printf("[engine-close] timeout sid=%s pending=%d age_ms=%d", s.ID, len(s.txPending), now.Sub(s.closeStart).Milliseconds())
+				closedSessionIDs = append(closedSessionIDs, s.ID)
+				s.mu.Unlock()
+				continue
+			}
+		}
 		s.mu.Unlock()
 	}
 
@@ -231,6 +406,7 @@ func (e *Engine) flushAll(ctx context.Context) {
 		go func(fname string, m []Envelope) {
 			e.sem <- struct{}{}        // Acquire
 			defer func() { <-e.sem }() // Release
+			atomic.AddUint64(&e.metrics.uploadFiles, 1)
 
 			pr, pw := io.Pipe()
 			go func() {
@@ -244,6 +420,7 @@ func (e *Engine) flushAll(ctx context.Context) {
 			}()
 
 			if err := e.backend.Upload(ctx, fname, pr); err != nil {
+				atomic.AddUint64(&e.metrics.uploadErrors, 1)
 				log.Printf("upload error %s: %v", fname, err)
 			}
 		}(filename, mux)
@@ -290,6 +467,7 @@ func (e *Engine) pollLoop(ctx context.Context) {
 			}
 			files, err := e.backend.ListQuery(ctx, prefix)
 			if err != nil {
+				atomic.AddUint64(&e.metrics.pollListErrors, 1)
 				log.Printf("poll list error: %v", err)
 				timer.Reset(currentPollInterval)
 				continue
@@ -330,6 +508,7 @@ func (e *Engine) pollLoop(ctx context.Context) {
 					tsStr = strings.TrimSuffix(tsStr, ".bin")
 					ts, _ := strconv.ParseInt(tsStr, 10, 64)
 					if ts > 0 && time.Since(time.Unix(0, ts)) > 5*time.Minute {
+						atomic.AddUint64(&e.metrics.staleDrops, 1)
 						e.backend.Delete(ctx, f) // Silent cleanup
 						continue
 					}
@@ -356,6 +535,7 @@ func (e *Engine) pollLoop(ctx context.Context) {
 					// log.Printf("Engine.pollLoop: Downloading %s", fname)
 					rc, err := e.backend.Download(ctx, fname)
 					if err != nil {
+						atomic.AddUint64(&e.metrics.downloadErrors, 1)
 						log.Printf("download error %s: %v", fname, err)
 						e.processedMu.Lock()
 						delete(e.processed, fname) // failed to download, retry next poll
@@ -410,6 +590,159 @@ func (e *Engine) RemoveSession(id string) {
 	e.closedSessionsMu.Unlock()
 }
 
+func (e *Engine) metricsSnapshot() engineMetricsSnapshot {
+	return engineMetricsSnapshot{
+		envelopesRX:      atomic.LoadUint64(&e.metrics.envelopesRX),
+		envelopesTX:      atomic.LoadUint64(&e.metrics.envelopesTX),
+		ackMarkersRX:     atomic.LoadUint64(&e.metrics.ackMarkersRX),
+		ackOnlyRX:        atomic.LoadUint64(&e.metrics.ackOnlyRX),
+		ackReleased:      atomic.LoadUint64(&e.metrics.ackReleased),
+		ackControlTX:     atomic.LoadUint64(&e.metrics.ackControlTX),
+		ackPiggybackTX:   atomic.LoadUint64(&e.metrics.ackPiggybackTX),
+		retransmitTX:     atomic.LoadUint64(&e.metrics.retransmitTX),
+		retransmitRounds: atomic.LoadUint64(&e.metrics.retransmitRounds),
+		uploadFiles:      atomic.LoadUint64(&e.metrics.uploadFiles),
+		uploadErrors:     atomic.LoadUint64(&e.metrics.uploadErrors),
+		pollListErrors:   atomic.LoadUint64(&e.metrics.pollListErrors),
+		downloadErrors:   atomic.LoadUint64(&e.metrics.downloadErrors),
+		decodeErrors:     atomic.LoadUint64(&e.metrics.decodeErrors),
+		cleanupDeletes:   atomic.LoadUint64(&e.metrics.cleanupDeletes),
+		staleDrops:       atomic.LoadUint64(&e.metrics.staleDrops),
+		closeAcked:       atomic.LoadUint64(&e.metrics.closeAcked),
+		closeTimedOut:    atomic.LoadUint64(&e.metrics.closeTimedOut),
+	}
+}
+
+func metricsDelta(cur, prev engineMetricsSnapshot) engineMetricsSnapshot {
+	return engineMetricsSnapshot{
+		envelopesRX:      cur.envelopesRX - prev.envelopesRX,
+		envelopesTX:      cur.envelopesTX - prev.envelopesTX,
+		ackMarkersRX:     cur.ackMarkersRX - prev.ackMarkersRX,
+		ackOnlyRX:        cur.ackOnlyRX - prev.ackOnlyRX,
+		ackReleased:      cur.ackReleased - prev.ackReleased,
+		ackControlTX:     cur.ackControlTX - prev.ackControlTX,
+		ackPiggybackTX:   cur.ackPiggybackTX - prev.ackPiggybackTX,
+		retransmitTX:     cur.retransmitTX - prev.retransmitTX,
+		retransmitRounds: cur.retransmitRounds - prev.retransmitRounds,
+		uploadFiles:      cur.uploadFiles - prev.uploadFiles,
+		uploadErrors:     cur.uploadErrors - prev.uploadErrors,
+		pollListErrors:   cur.pollListErrors - prev.pollListErrors,
+		downloadErrors:   cur.downloadErrors - prev.downloadErrors,
+		decodeErrors:     cur.decodeErrors - prev.decodeErrors,
+		cleanupDeletes:   cur.cleanupDeletes - prev.cleanupDeletes,
+		staleDrops:       cur.staleDrops - prev.staleDrops,
+		closeAcked:       cur.closeAcked - prev.closeAcked,
+		closeTimedOut:    cur.closeTimedOut - prev.closeTimedOut,
+	}
+}
+
+func (d engineMetricsSnapshot) isZero() bool {
+	return d.envelopesRX == 0 &&
+		d.envelopesTX == 0 &&
+		d.ackMarkersRX == 0 &&
+		d.ackOnlyRX == 0 &&
+		d.ackReleased == 0 &&
+		d.ackControlTX == 0 &&
+		d.ackPiggybackTX == 0 &&
+		d.retransmitTX == 0 &&
+		d.retransmitRounds == 0 &&
+		d.uploadFiles == 0 &&
+		d.uploadErrors == 0 &&
+		d.pollListErrors == 0 &&
+		d.downloadErrors == 0 &&
+		d.decodeErrors == 0 &&
+		d.cleanupDeletes == 0 &&
+		d.staleDrops == 0 &&
+		d.closeAcked == 0 &&
+		d.closeTimedOut == 0
+}
+
+func (e *Engine) liveQueueSnapshot() (sessions, pendingTX, rxQueued, txBufBytes int) {
+	e.sessionMu.RLock()
+	all := make([]*Session, 0, len(e.sessions))
+	for _, s := range e.sessions {
+		all = append(all, s)
+	}
+	e.sessionMu.RUnlock()
+
+	sessions = len(all)
+	for _, s := range all {
+		s.mu.Lock()
+		pendingTX += len(s.txPending)
+		rxQueued += len(s.rxQueue)
+		txBufBytes += len(s.txBuf)
+		s.mu.Unlock()
+	}
+	return
+}
+
+func (e *Engine) metricsLoop(ctx context.Context) {
+	ticker := time.NewTicker(metricsLogInterval)
+	defer ticker.Stop()
+
+	prev := e.metricsSnapshot()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			cur := e.metricsSnapshot()
+			delta := metricsDelta(cur, prev)
+			prev = cur
+
+			sessions, pendingTX, rxQueued, txBufBytes := e.liveQueueSnapshot()
+			if sessions == 0 && delta.isZero() {
+				continue
+			}
+
+			log.Printf(
+				"[engine-metrics] dir=%s sessions=%d pending_tx=%d rx_queue=%d txbuf_bytes=%d tx_env=%d(+%d) rx_env=%d(+%d) ack_rx=%d(+%d) ack_only_rx=%d(+%d) ack_release=%d(+%d) ack_ctrl_tx=%d(+%d) ack_piggy_tx=%d(+%d) retrans_tx=%d(+%d) retrans_rounds=%d(+%d) uploads=%d(+%d) upload_err=%d(+%d) poll_err=%d(+%d) dl_err=%d(+%d) decode_err=%d(+%d) cleanup_del=%d(+%d) stale_drop=%d(+%d) close_acked=%d(+%d) close_timeout=%d(+%d)",
+				e.myDir,
+				sessions,
+				pendingTX,
+				rxQueued,
+				txBufBytes,
+				cur.envelopesTX,
+				delta.envelopesTX,
+				cur.envelopesRX,
+				delta.envelopesRX,
+				cur.ackMarkersRX,
+				delta.ackMarkersRX,
+				cur.ackOnlyRX,
+				delta.ackOnlyRX,
+				cur.ackReleased,
+				delta.ackReleased,
+				cur.ackControlTX,
+				delta.ackControlTX,
+				cur.ackPiggybackTX,
+				delta.ackPiggybackTX,
+				cur.retransmitTX,
+				delta.retransmitTX,
+				cur.retransmitRounds,
+				delta.retransmitRounds,
+				cur.uploadFiles,
+				delta.uploadFiles,
+				cur.uploadErrors,
+				delta.uploadErrors,
+				cur.pollListErrors,
+				delta.pollListErrors,
+				cur.downloadErrors,
+				delta.downloadErrors,
+				cur.decodeErrors,
+				delta.decodeErrors,
+				cur.cleanupDeletes,
+				delta.cleanupDeletes,
+				cur.staleDrops,
+				delta.staleDrops,
+				cur.closeAcked,
+				delta.closeAcked,
+				cur.closeTimedOut,
+				delta.closeTimedOut,
+			)
+		}
+	}
+}
+
 func (e *Engine) cleanupLoop(ctx context.Context) {
 	ticker := time.NewTicker(5 * time.Second)
 	defer ticker.Stop()
@@ -459,6 +792,7 @@ func (e *Engine) cleanupLoop(ctx context.Context) {
 					if err == nil {
 						t := time.Unix(0, ts)
 						if time.Since(t) > 10*time.Second {
+							atomic.AddUint64(&e.metrics.cleanupDeletes, 1)
 							e.backend.Delete(ctx, f)
 						}
 					}

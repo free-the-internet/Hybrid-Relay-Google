@@ -65,6 +65,8 @@ Use [hybrid/SaffronBridge/starter/appscript_relay.gs](hybrid/SaffronBridge/start
 
 1. Open https://script.google.com and create a new project.
 2. Replace default code with `appscript_relay.gs` content.
+   - Important: this script must return JSON fields `ok`, `relay_status`, `relay_body`, `error`.
+   - Client now validates these fields strictly before treating a relay upload as success.
 3. Edit these values:
    - `RELAY_URL`
    - `SHARED_TOKEN`

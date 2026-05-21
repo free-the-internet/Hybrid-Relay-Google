@@ -11,14 +11,30 @@
 // The payload is forwarded unchanged. It can be either:
 // - single upload JSON { filename, payload_b64 }
 // - batch upload JSON { uploads: [{ filename, payload_b64 }, ...] }
+//
+// This relay returns JSON status to the client:
+// {
+//   ok: boolean,
+//   relay_status: number,
+//   relay_body: string,
+//   error: string
+// }
 
 var RELAY_URL = 'http://YOUR_VPS_IP:8099/relay';
 var SHARED_TOKEN = 'CHANGE_ME';
 
 function doPost(e) {
+  var out = {
+    ok: false,
+    relay_status: 0,
+    relay_body: '',
+    error: ''
+  };
+
   try {
     if (!e || !e.postData || !e.postData.contents) {
-      return ContentService.createTextOutput('missing body').setMimeType(ContentService.MimeType.TEXT);
+      out.error = 'missing body';
+      return ContentService.createTextOutput(JSON.stringify(out)).setMimeType(ContentService.MimeType.JSON);
     }
 
     var options = {
@@ -32,8 +48,12 @@ function doPost(e) {
     };
 
     var res = UrlFetchApp.fetch(RELAY_URL, options);
-    return ContentService.createTextOutput(res.getContentText()).setMimeType(ContentService.MimeType.TEXT);
+    out.relay_status = res.getResponseCode();
+    out.relay_body = res.getContentText();
+    out.ok = out.relay_status >= 200 && out.relay_status < 300;
   } catch (err) {
-    return ContentService.createTextOutput('relay error: ' + err).setMimeType(ContentService.MimeType.TEXT);
+    out.error = String(err);
   }
+
+  return ContentService.createTextOutput(JSON.stringify(out)).setMimeType(ContentService.MimeType.JSON);
 }

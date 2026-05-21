@@ -70,10 +70,7 @@ func (v *VirtualConn) Write(b []byte) (n int, err error) {
 }
 
 func (v *VirtualConn) Close() error {
-	v.session.mu.Lock()
-	v.session.closed = true
-	v.session.txCond.Broadcast() // Wake up any writers blocked on backpressure
-	v.session.mu.Unlock()
+	v.session.RequestClose()
 	
 	// A closed connection no longer accepts writes efficiently
 	// Next periodic engine flush will securely remove context

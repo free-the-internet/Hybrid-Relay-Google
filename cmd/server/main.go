@@ -98,7 +98,8 @@ func main() {
 }
 
 func handleServerConn(sessionID, targetAddr string, session *transport.Session, engine *transport.Engine) {
-	defer engine.RemoveSession(sessionID)
+	_ = engine
+	defer session.RequestClose()
 
 	conn, err := net.Dial("tcp", targetAddr)
 	if err != nil {

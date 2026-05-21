@@ -2,15 +2,68 @@ name: Release
 
 on:
   push:
-    tags:
-      - 'v*'
+    branches:
+      - '**'
 
 permissions:
   contents: write
 
 jobs:
-  build-and-release:
-    name: Build and Release
+  tag-version:
+    name: Tag Version
+    runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.version.outputs.tag }}
+      version: ${{ steps.version.outputs.version }}
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Create or Reuse Version Tag
+        id: version
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          git fetch --tags --force
+
+          EXISTING_TAG="$(git tag --points-at HEAD -l 'v*' --sort=-v:refname | head -n1 || true)"
+          if [[ -n "$EXISTING_TAG" ]]; then
+            TAG="$EXISTING_TAG"
+          else
+            LATEST_TAG="$(git tag -l 'v*' --sort=-v:refname | head -n1 || true)"
+            if [[ -z "$LATEST_TAG" ]]; then
+              LATEST_TAG="v0.0.0"
+            fi
+
+            if [[ ! "$LATEST_TAG" =~ ^v([0-9]+)\.([0-9]+)\.([0-9]+)$ ]]; then
+              echo "Latest tag '$LATEST_TAG' is not semver (vMAJOR.MINOR.PATCH)."
+              exit 1
+            fi
+
+            MAJOR="${BASH_REMATCH[1]}"
+            MINOR="${BASH_REMATCH[2]}"
+            PATCH="${BASH_REMATCH[3]}"
+            NEXT_PATCH=$((PATCH + 1))
+            TAG="v${MAJOR}.${MINOR}.${NEXT_PATCH}"
+
+            git config user.name "github-actions[bot]"
+            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+            git tag -a "$TAG" -m "Release $TAG"
+            git push origin "$TAG"
+          fi
+
+          VERSION="${TAG#v}"
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "Using release tag: $TAG"
+
+  build:
+    name: Build Artifacts
+    needs: tag-version
     runs-on: ubuntu-latest
     strategy:
       matrix:
@@ -66,14 +119,12 @@ jobs:
       - name: Build Binaries
         shell: bash
         run: |
-          VERSION=${GITHUB_REF_NAME}
+          VERSION=${{ needs.tag-version.outputs.version }}
           
-          CLIENT_FOLDER="flowdriver-client-${VERSION}-${{ matrix.os }}"
-          SERVER_FOLDER="flowdriver-server-${VERSION}-${{ matrix.os }}"
-          HYBRID_FOLDER="flowdriver-hybrid-${VERSION}-${{ matrix.os }}"
+          CLIENT_FOLDER="hybrid-relay-google-client-${VERSION}-${{ matrix.os }}"
+          HYBRID_FOLDER="hybrid-relay-google-hybrid-${VERSION}-${{ matrix.os }}"
           
           mkdir -p $CLIENT_FOLDER
-          mkdir -p $SERVER_FOLDER
           mkdir -p $HYBRID_FOLDER
           
           SUFFIX=""
@@ -83,9 +134,6 @@ jobs:
           
           # Build Client
           CGO_ENABLED=0 GOOS=${{ matrix.goos }} GOARCH=${{ matrix.goarch }} GOARM=${{ matrix.goarm }} go build -o $CLIENT_FOLDER/client$SUFFIX ./cmd/client
-          
-          # Build Server
-          CGO_ENABLED=0 GOOS=${{ matrix.goos }} GOARCH=${{ matrix.goarch }} GOARM=${{ matrix.goarm }} go build -o $SERVER_FOLDER/server$SUFFIX ./cmd/server
 
           # Build Hybrid Exit
           CGO_ENABLED=0 GOOS=${{ matrix.goos }} GOARCH=${{ matrix.goarch }} GOARM=${{ matrix.goarm }} go build -o $HYBRID_FOLDER/hybrid-exit$SUFFIX ./cmd/hybrid-exit
@@ -97,12 +145,6 @@ jobs:
             cp client_config.example.json $CLIENT_FOLDER/client_config.json
           elif [ -f hybrid/SaffronBridge/starter/client_config.example.jsonc ]; then
             cp hybrid/SaffronBridge/starter/client_config.example.jsonc $CLIENT_FOLDER/client_config.example.jsonc
-          fi
-
-          if [ -f server_config.json.example ]; then
-            cp server_config.json.example $SERVER_FOLDER/server_config.json
-          elif [ -f exit_config.example.json ]; then
-            cp exit_config.example.json $SERVER_FOLDER/server_config.json
           fi
 
           if [ -f hybrid/SaffronBridge/starter/client_config.example.jsonc ]; then
@@ -117,18 +159,43 @@ jobs:
           
           # Copy README
           cp README.md $CLIENT_FOLDER/
-          cp README.md $SERVER_FOLDER/
           cp README.md $HYBRID_FOLDER/
           cp HYBRID.MD $HYBRID_FOLDER/
           
           # Zip the folders
           zip -r "${CLIENT_FOLDER}.zip" $CLIENT_FOLDER
-          zip -r "${SERVER_FOLDER}.zip" $SERVER_FOLDER
           zip -r "${HYBRID_FOLDER}.zip" $HYBRID_FOLDER
+
+      - name: Upload Build Artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: packages-${{ matrix.os }}
+          path: |
+            hybrid-relay-google-client-${{ needs.tag-version.outputs.version }}-${{ matrix.os }}.zip
+            hybrid-relay-google-hybrid-${{ needs.tag-version.outputs.version }}-${{ matrix.os }}.zip
+
+  release:
+    name: Publish Release
+    needs:
+      - tag-version
+      - build
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Download Build Artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: packages-*
+          path: dist
+          merge-multiple: true
 
       - name: Release
         uses: softprops/action-gh-release@v1
         with:
-          files: '*.zip'
+          tag_name: ${{ needs.tag-version.outputs.tag }}
+          name: ${{ needs.tag-version.outputs.tag }}
+          files: dist/*.zip
+          fail_on_unmatched_files: true
+          generate_release_notes: true
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

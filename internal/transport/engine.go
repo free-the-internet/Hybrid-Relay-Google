@@ -23,6 +23,8 @@ type Engine struct {
 	peerDir Direction // DirRes for client, DirReq for server
 	id      string    // ClientID for client, empty for server
 
+	tunnelAckEnabled bool
+
 	sessions  map[string]*Session
 	sessionMu sync.RWMutex
 
@@ -56,6 +58,8 @@ type engineMetrics struct {
 	ackPiggybackTX   uint64
 	retransmitTX     uint64
 	retransmitRounds uint64
+	guardClose       uint64
+	guardDrop        uint64
 	uploadFiles      uint64
 	uploadErrors     uint64
 	pollListErrors   uint64
@@ -77,6 +81,8 @@ type engineMetricsSnapshot struct {
 	ackPiggybackTX   uint64
 	retransmitTX     uint64
 	retransmitRounds uint64
+	guardClose       uint64
+	guardDrop        uint64
 	uploadFiles      uint64
 	uploadErrors     uint64
 	pollListErrors   uint64
@@ -90,8 +96,20 @@ type engineMetricsSnapshot struct {
 
 const (
 	// Retransmit unacked tunnel envelopes conservatively to avoid quota spikes.
-	txRetransmitAfter = 5 * time.Second
-	txRetransmitBurst = 4
+	txRetransmitAfter = 8 * time.Second
+	// In stall conditions, further relax retransmit timeout to avoid spurious duplicates.
+	txRetransmitAfterStalled = 12 * time.Second
+	txRetransmitBurst        = 4
+	// In severe stalls, reduce burst to keep quota usage bounded.
+	txRetransmitBurstStalled = 2
+
+	// Session guardrails to isolate poisoned/stuck flows.
+	txPendingStallThreshold = 12
+	txPendingHardCap        = 48
+	txPendingStallAfter     = 12 * time.Second
+	txPendingDropAfter      = 20 * time.Second
+	guardLogInterval        = 2 * time.Second
+	retransmitLogInterval   = 2 * time.Second
 
 	// If no data is going out, send occasional lightweight ACK control frames.
 	ackControlInterval = 2 * time.Second
@@ -100,15 +118,19 @@ const (
 
 	// Keep closed sessions around long enough to flush/retransmit tail packets.
 	closeDrainTimeout = 25 * time.Second
+
+	// Cleanup is only for crash leftovers; keep generous TTL to avoid deleting live peer traffic.
+	cleanupFileTTL = 3 * time.Minute
 )
 
 func NewEngine(backend storage.Backend, isClient bool, clientID string) *Engine {
 	e := &Engine{
-		backend:        backend,
-		id:             clientID,
-		sessions:       make(map[string]*Session),
-		closedSessions: make(map[string]time.Time),
-		processed:      make(map[string]bool),
+		backend:          backend,
+		id:               clientID,
+		tunnelAckEnabled: true,
+		sessions:         make(map[string]*Session),
+		closedSessions:   make(map[string]time.Time),
+		processed:        make(map[string]bool),
 		// Default intervals: Poll (RX) fast for responsiveness, Flush (TX) slower for gathering
 		pollTicker:  500 * time.Millisecond,
 		flushTicker: 300 * time.Millisecond,
@@ -145,6 +167,14 @@ func (e *Engine) SetFlushRate(ms int) {
 	if ms > 0 {
 		e.flushTicker = time.Duration(ms) * time.Millisecond
 	}
+}
+
+func (e *Engine) SetTunnelAckEnabled(enabled bool) {
+	e.tunnelAckEnabled = enabled
+}
+
+func (e *Engine) TunnelAckEnabled() bool {
+	return e.tunnelAckEnabled
 }
 
 func (e *Engine) Start(ctx context.Context) {
@@ -207,7 +237,7 @@ func (e *Engine) processEnvelope(env *Envelope, fileClientID string) {
 	}
 
 	if s != nil {
-		if hasAck {
+		if hasAck && e.tunnelAckEnabled {
 			released := s.ApplyRemoteAck(ackSeq)
 			if released > 0 {
 				atomic.AddUint64(&e.metrics.ackReleased, released)
@@ -282,21 +312,68 @@ func (e *Engine) flushAll(ctx context.Context) {
 			cid = "unknown"
 		}
 
-		// Retransmit oldest unacked envelopes first.
-		if len(s.txPending) > 0 {
+		// Retransmit oldest unacked envelopes first, with guardrails for stuck sessions.
+		if e.tunnelAckEnabled && len(s.txPending) > 0 {
+			retxAfter := txRetransmitAfter
+			if len(s.txPending) >= txPendingStallThreshold {
+				retxAfter = txRetransmitAfterStalled
+			}
+
 			pendingSeqs := make([]uint64, 0, len(s.txPending))
+			var oldestPendingAt time.Time
 			for seq, p := range s.txPending {
-				if now.Sub(p.sentAt) >= txRetransmitAfter {
+				if oldestPendingAt.IsZero() || p.sentAt.Before(oldestPendingAt) {
+					oldestPendingAt = p.sentAt
+				}
+				if now.Sub(p.sentAt) >= retxAfter {
 					pendingSeqs = append(pendingSeqs, seq)
 				}
 			}
+
+			oldestPendingAge := time.Duration(0)
+			if !oldestPendingAt.IsZero() {
+				oldestPendingAge = now.Sub(oldestPendingAt)
+			}
+
+			if len(s.txPending) >= txPendingHardCap && oldestPendingAge >= txPendingDropAfter {
+				if now.Sub(s.lastGuardLog) >= guardLogInterval {
+					log.Printf("[engine-guard] drop sid=%s pending=%d oldest_ms=%d rx_next=%d", s.ID, len(s.txPending), oldestPendingAge.Milliseconds(), s.rxSeq)
+					s.lastGuardLog = now
+				}
+				atomic.AddUint64(&e.metrics.guardDrop, 1)
+				closedSessionIDs = append(closedSessionIDs, s.ID)
+				s.mu.Unlock()
+				continue
+			}
+
+			if !s.closed && len(s.txPending) >= txPendingStallThreshold && oldestPendingAge >= txPendingStallAfter {
+				if now.Sub(s.lastGuardLog) >= guardLogInterval {
+					log.Printf("[engine-guard] close sid=%s pending=%d oldest_ms=%d rx_next=%d", s.ID, len(s.txPending), oldestPendingAge.Milliseconds(), s.rxSeq)
+					s.lastGuardLog = now
+				}
+				atomic.AddUint64(&e.metrics.guardClose, 1)
+				s.closed = true
+				if s.closeStart.IsZero() {
+					s.closeStart = now
+				}
+				s.txCond.Broadcast()
+			}
+
 			sort.Slice(pendingSeqs, func(i, j int) bool { return pendingSeqs[i] < pendingSeqs[j] })
-			if len(pendingSeqs) > txRetransmitBurst {
-				pendingSeqs = pendingSeqs[:txRetransmitBurst]
+			retxBurst := txRetransmitBurst
+			if len(s.txPending) >= txPendingStallThreshold {
+				retxBurst = txRetransmitBurstStalled
+			}
+			if len(pendingSeqs) > retxBurst {
+				pendingSeqs = pendingSeqs[:retxBurst]
 			}
 			if len(pendingSeqs) > 0 {
 				atomic.AddUint64(&e.metrics.retransmitRounds, 1)
-				log.Printf("[engine-ack] retransmit sid=%s count=%d pending=%d rx_next=%d", s.ID, len(pendingSeqs), len(s.txPending), s.rxSeq)
+				if now.Sub(s.lastRetxLog) >= retransmitLogInterval || s.lastRetxPend != len(s.txPending) {
+					log.Printf("[engine-ack] retransmit sid=%s count=%d pending=%d rx_next=%d", s.ID, len(pendingSeqs), len(s.txPending), s.rxSeq)
+					s.lastRetxLog = now
+					s.lastRetxPend = len(s.txPending)
+				}
 			}
 
 			for _, seq := range pendingSeqs {
@@ -316,10 +393,23 @@ func (e *Engine) flushAll(ctx context.Context) {
 		}
 
 		sendClose := s.closed && !s.closeSent
-		shouldSend := len(s.txBuf) > 0 || (s.txSeq == 0 && e.myDir == DirReq) || sendClose
+		pendingAtCap := e.tunnelAckEnabled && len(s.txPending) >= txPendingHardCap
+		if pendingAtCap && !s.closed && now.Sub(s.lastGuardLog) >= guardLogInterval {
+			log.Printf("[engine-guard] hold sid=%s pending=%d txbuf=%d", s.ID, len(s.txPending), len(s.txBuf))
+			s.lastGuardLog = now
+		}
+		shouldSendData := len(s.txBuf) > 0 || (s.txSeq == 0 && e.myDir == DirReq)
+		shouldSend := (shouldSendData && !pendingAtCap) || sendClose
 
 		if shouldSend {
 			payload := s.txBuf
+			if pendingAtCap && len(payload) > 0 {
+				if now.Sub(s.lastGuardLog) >= guardLogInterval {
+					log.Printf("[engine-guard] drop-buffer sid=%s bytes=%d pending=%d", s.ID, len(payload), len(s.txPending))
+					s.lastGuardLog = now
+				}
+				payload = nil
+			}
 			s.txBuf = nil
 			s.txCond.Broadcast() // Release any blocked writers
 
@@ -327,7 +417,7 @@ func (e *Engine) flushAll(ctx context.Context) {
 			if s.txSeq == 0 {
 				targetAddr = s.TargetAddr
 			}
-			if targetAddr == "" {
+			if e.tunnelAckEnabled && targetAddr == "" {
 				targetAddr = makeAckMarker(s.rxSeq)
 				s.ackDirty = false
 				atomic.AddUint64(&e.metrics.ackPiggybackTX, 1)
@@ -343,13 +433,15 @@ func (e *Engine) flushAll(ctx context.Context) {
 				TargetAddr: targetAddr,
 			}
 
-			s.txPending[s.txSeq] = &pendingEnvelope{env: env, sentAt: now}
+			if e.tunnelAckEnabled {
+				s.txPending[s.txSeq] = &pendingEnvelope{env: env, sentAt: now}
+			}
 			if envClose {
 				s.closeSent = true
 			}
 
 			s.txSeq++
-			if s.closed {
+			if envClose && !e.tunnelAckEnabled {
 				closedSessionIDs = append(closedSessionIDs, s.ID)
 			}
 
@@ -359,7 +451,7 @@ func (e *Engine) flushAll(ctx context.Context) {
 			continue
 		}
 
-		if s.txSeq > 0 && s.ackDirty && now.Sub(s.lastAckCtrl) >= ackControlInterval {
+		if e.tunnelAckEnabled && s.txSeq > 0 && s.ackDirty && now.Sub(s.lastAckCtrl) >= ackControlInterval {
 			ackEnv := Envelope{
 				SessionID:  s.ID,
 				Seq:        0,
@@ -372,7 +464,7 @@ func (e *Engine) flushAll(ctx context.Context) {
 			s.ackDirty = false
 		}
 
-		if s.closed && s.closeSent {
+		if e.tunnelAckEnabled && s.closed && s.closeSent {
 			if len(s.txPending) == 0 {
 				atomic.AddUint64(&e.metrics.closeAcked, 1)
 				closedSessionIDs = append(closedSessionIDs, s.ID)
@@ -536,10 +628,17 @@ func (e *Engine) pollLoop(ctx context.Context) {
 					rc, err := e.backend.Download(ctx, fname)
 					if err != nil {
 						atomic.AddUint64(&e.metrics.downloadErrors, 1)
-						log.Printf("download error %s: %v", fname, err)
-						e.processedMu.Lock()
-						delete(e.processed, fname) // failed to download, retry next poll
-						e.processedMu.Unlock()
+						if isStorageNotFoundError(err) {
+							// The listed file disappeared before download (typically peer cleanup/race).
+							// Keep it marked as processed to avoid retry storms on stale list views.
+							atomic.AddUint64(&e.metrics.staleDrops, 1)
+							log.Printf("download miss %s: %v", fname, err)
+						} else {
+							log.Printf("download error %s: %v", fname, err)
+							e.processedMu.Lock()
+							delete(e.processed, fname) // retry on transient transport/backend errors
+							e.processedMu.Unlock()
+						}
 						return
 					}
 					defer rc.Close()
@@ -601,6 +700,8 @@ func (e *Engine) metricsSnapshot() engineMetricsSnapshot {
 		ackPiggybackTX:   atomic.LoadUint64(&e.metrics.ackPiggybackTX),
 		retransmitTX:     atomic.LoadUint64(&e.metrics.retransmitTX),
 		retransmitRounds: atomic.LoadUint64(&e.metrics.retransmitRounds),
+		guardClose:       atomic.LoadUint64(&e.metrics.guardClose),
+		guardDrop:        atomic.LoadUint64(&e.metrics.guardDrop),
 		uploadFiles:      atomic.LoadUint64(&e.metrics.uploadFiles),
 		uploadErrors:     atomic.LoadUint64(&e.metrics.uploadErrors),
 		pollListErrors:   atomic.LoadUint64(&e.metrics.pollListErrors),
@@ -611,6 +712,17 @@ func (e *Engine) metricsSnapshot() engineMetricsSnapshot {
 		closeAcked:       atomic.LoadUint64(&e.metrics.closeAcked),
 		closeTimedOut:    atomic.LoadUint64(&e.metrics.closeTimedOut),
 	}
+}
+
+func isStorageNotFoundError(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := strings.ToLower(err.Error())
+	return strings.Contains(msg, "returned 404") ||
+		strings.Contains(msg, `"code": 404`) ||
+		strings.Contains(msg, `"reason": "notfound"`) ||
+		strings.Contains(msg, "file not found")
 }
 
 func metricsDelta(cur, prev engineMetricsSnapshot) engineMetricsSnapshot {
@@ -624,6 +736,8 @@ func metricsDelta(cur, prev engineMetricsSnapshot) engineMetricsSnapshot {
 		ackPiggybackTX:   cur.ackPiggybackTX - prev.ackPiggybackTX,
 		retransmitTX:     cur.retransmitTX - prev.retransmitTX,
 		retransmitRounds: cur.retransmitRounds - prev.retransmitRounds,
+		guardClose:       cur.guardClose - prev.guardClose,
+		guardDrop:        cur.guardDrop - prev.guardDrop,
 		uploadFiles:      cur.uploadFiles - prev.uploadFiles,
 		uploadErrors:     cur.uploadErrors - prev.uploadErrors,
 		pollListErrors:   cur.pollListErrors - prev.pollListErrors,
@@ -646,6 +760,8 @@ func (d engineMetricsSnapshot) isZero() bool {
 		d.ackPiggybackTX == 0 &&
 		d.retransmitTX == 0 &&
 		d.retransmitRounds == 0 &&
+		d.guardClose == 0 &&
+		d.guardDrop == 0 &&
 		d.uploadFiles == 0 &&
 		d.uploadErrors == 0 &&
 		d.pollListErrors == 0 &&
@@ -696,7 +812,7 @@ func (e *Engine) metricsLoop(ctx context.Context) {
 			}
 
 			log.Printf(
-				"[engine-metrics] dir=%s sessions=%d pending_tx=%d rx_queue=%d txbuf_bytes=%d tx_env=%d(+%d) rx_env=%d(+%d) ack_rx=%d(+%d) ack_only_rx=%d(+%d) ack_release=%d(+%d) ack_ctrl_tx=%d(+%d) ack_piggy_tx=%d(+%d) retrans_tx=%d(+%d) retrans_rounds=%d(+%d) uploads=%d(+%d) upload_err=%d(+%d) poll_err=%d(+%d) dl_err=%d(+%d) decode_err=%d(+%d) cleanup_del=%d(+%d) stale_drop=%d(+%d) close_acked=%d(+%d) close_timeout=%d(+%d)",
+				"[engine-metrics] dir=%s sessions=%d pending_tx=%d rx_queue=%d txbuf_bytes=%d tx_env=%d(+%d) rx_env=%d(+%d) ack_rx=%d(+%d) ack_only_rx=%d(+%d) ack_release=%d(+%d) ack_ctrl_tx=%d(+%d) ack_piggy_tx=%d(+%d) retrans_tx=%d(+%d) retrans_rounds=%d(+%d) guard_close=%d(+%d) guard_drop=%d(+%d) uploads=%d(+%d) upload_err=%d(+%d) poll_err=%d(+%d) dl_err=%d(+%d) decode_err=%d(+%d) cleanup_del=%d(+%d) stale_drop=%d(+%d) close_acked=%d(+%d) close_timeout=%d(+%d)",
 				e.myDir,
 				sessions,
 				pendingTX,
@@ -720,6 +836,10 @@ func (e *Engine) metricsLoop(ctx context.Context) {
 				delta.retransmitTX,
 				cur.retransmitRounds,
 				delta.retransmitRounds,
+				cur.guardClose,
+				delta.guardClose,
+				cur.guardDrop,
+				delta.guardDrop,
 				cur.uploadFiles,
 				delta.uploadFiles,
 				cur.uploadErrors,
@@ -791,7 +911,7 @@ func (e *Engine) cleanupLoop(ctx context.Context) {
 					ts, err := strconv.ParseInt(tsStr, 10, 64)
 					if err == nil {
 						t := time.Unix(0, ts)
-						if time.Since(t) > 10*time.Second {
+						if time.Since(t) > cleanupFileTTL {
 							atomic.AddUint64(&e.metrics.cleanupDeletes, 1)
 							e.backend.Delete(ctx, f)
 						}

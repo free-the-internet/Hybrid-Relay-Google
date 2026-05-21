@@ -68,6 +68,13 @@ func main() {
 	}
 
 	engine := transport.NewEngine(backend, false, "")
+	ackEnabled := appCfg.TunnelAckEnabled(false)
+	engine.SetTunnelAckEnabled(ackEnabled)
+	if ackEnabled {
+		log.Printf("Tunnel ACK mode: enabled")
+	} else {
+		log.Printf("Tunnel ACK mode: disabled (latency-first)")
+	}
 	if appCfg.RefreshRateMs > 0 {
 		engine.SetPollRate(appCfg.RefreshRateMs)
 	}

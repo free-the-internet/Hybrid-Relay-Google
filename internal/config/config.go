@@ -37,6 +37,10 @@ type AppConfig struct {
 	// HybridRelay enables the SaffronBridge mode where client uploads requests
 	// through Apps Script relay while responses continue via Drive polling.
 	HybridRelay HybridRelayConfig `json:"hybrid_relay,omitempty"`
+
+	// AckInTunnel controls tunnel-level ACK markers and retransmit behavior.
+	// Nil means use the binary-specific default.
+	AckInTunnel *bool `json:"ack_in_tunnel,omitempty"`
 }
 
 // HybridRelayConfig defines options for the Apps Script request relay path.
@@ -76,4 +80,12 @@ func Load(path string) (*AppConfig, error) {
 	}
 
 	return &cfg, nil
+}
+
+// TunnelAckEnabled resolves the ACK/retransmit mode with a caller-provided default.
+func (c *AppConfig) TunnelAckEnabled(defaultValue bool) bool {
+	if c.AckInTunnel == nil {
+		return defaultValue
+	}
+	return *c.AckInTunnel
 }

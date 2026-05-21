@@ -119,6 +119,14 @@ func main() {
 		cid = generateSessionID()[:8] // Short random ID as fallback
 	}
 	engine := transport.NewEngine(backend, true, cid)
+	defaultTunnelAck := appCfg.StorageType != "saffronbridge"
+	ackEnabled := appCfg.TunnelAckEnabled(defaultTunnelAck)
+	engine.SetTunnelAckEnabled(ackEnabled)
+	if ackEnabled {
+		log.Printf("Tunnel ACK mode: enabled")
+	} else {
+		log.Printf("Tunnel ACK mode: disabled (latency-first)")
+	}
 	if appCfg.RefreshRateMs > 0 {
 		engine.SetPollRate(appCfg.RefreshRateMs)
 	}

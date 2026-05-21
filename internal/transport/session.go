@@ -23,8 +23,11 @@ type Session struct {
 	rxSeq        uint64
 	rxQueue      map[uint64]*Envelope
 	lastActivity time.Time
+	lastGuardLog time.Time
 	ackDirty     bool
 	lastAckCtrl  time.Time
+	lastRetxLog  time.Time
+	lastRetxPend int
 	closed       bool
 	closeSent    bool
 	closeStart   time.Time
@@ -50,6 +53,7 @@ func NewSession(id string) *Session {
 		txPending:    make(map[uint64]*pendingEnvelope),
 		rxQueue:      make(map[uint64]*Envelope),
 		lastActivity: time.Now(),
+		lastRetxPend: -1,
 		RxChan:       make(chan []byte, 1024),
 	}
 	s.txCond = sync.NewCond(&s.mu)

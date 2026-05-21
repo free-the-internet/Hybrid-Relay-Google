@@ -94,6 +94,7 @@ In client config, `hybrid_relay.appscript_url` can be either:
    - `google_folder_id` (same folder used by client)
    - `hybrid_relay.shared_token` (must match Apps Script token)
    - `hybrid_relay.exit_listen_addr`
+   - `ack_in_tunnel`
 3. For direct mode use:
    - `"exit_listen_addr": "0.0.0.0:8099"`
 4. Open firewall/security-group inbound TCP 8099.
@@ -111,6 +112,7 @@ In client config, `hybrid_relay.appscript_url` can be either:
    - `google_folder_id` (same as VPS)
    - `hybrid_relay.appscript_url` (Deployment ID or full /exec URL)
    - `hybrid_relay.shared_token` (same as VPS)
+   - `ack_in_tunnel`
 3. Transport notes for hybrid:
    - Keep `TargetIP` and `SNI` for fronting.
    - Prefer `SNI: "www.google.com"` for relay stability.
@@ -123,6 +125,10 @@ In client config, `hybrid_relay.appscript_url` can be either:
    ```bash
    ./bin/client -c client_config.json -gc credentials.json
    ```
+
+Latency mode note:
+- `ack_in_tunnel: false` disables tunnel-level ACK control/retransmit and is now the default for hybrid starter configs.
+- If you need stronger reliability more than speed, set `ack_in_tunnel: true` on both client and exit.
 5. Use SOCKS5 at `127.0.0.1:1080` (or your configured `listen_addr`).
 
 ## 7. Quick checks

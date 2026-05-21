@@ -71,7 +71,7 @@ func (v *VirtualConn) Write(b []byte) (n int, err error) {
 
 func (v *VirtualConn) Close() error {
 	v.session.RequestClose()
-	
+
 	// A closed connection no longer accepts writes efficiently
 	// Next periodic engine flush will securely remove context
 	return nil
